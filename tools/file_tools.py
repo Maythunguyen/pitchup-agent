@@ -2,7 +2,7 @@
 File system operations for research agents.
 """
 import os
-from connectonion import xray
+# connectonion xray removed
 
 class FileTools:
     """Tools for reading and writing files."""

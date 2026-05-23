@@ -1,0 +1,238 @@
+"""
+Purpose: Find interactive elements on web pages using natural language descriptions via vision LLM
+LLM-Note:
+  Dependencies: imports from [playwright.sync_api Page, connectonion llm_do, pydantic, pathlib] | imported by [cli/browser_agent/browser.py] | tested by [tests/cli/test_element_finder.py]
+  Data flow: extract_elements(page) → evaluates extract_elements.js → injects data-browser-agent-id on all interactive elements → returns list[InteractiveElement] with locators | find_element(page, description, elements) → formats elements for LLM → calls llm_do with vision model + screenshot → LLM selects matching element by index → returns InteractiveElement with pre-built locator
+  State/Effects: modifies DOM by injecting data-browser-agent-id attributes (temporary, removed on navigation) | takes screenshot for vision analysis | no persistent state
+  Integration: exposes extract_elements(page) → list[InteractiveElement], find_element(page, description, elements, screenshot) → InteractiveElement|None, highlight_element(page, element) for visual feedback | InteractiveElement model has tag, text, role, aria_label, placeholder, x, y, width, height, locator | ElementMatch model for LLM response
+  Performance: JavaScript extraction is fast | LLM matching uses vision model (slower) | pre-built locators (no retry needed)
+  Errors: returns None if no matching element found | raises if Playwright page not available | element may be stale if page navigates
+Element Finder - Find interactive elements by natural language description.
+
+Inspired by browser-use (https://github.com/browser-use/browser-use).
+
+Architecture:
+1. JavaScript injects `data-browser-agent-id` into each interactive element
+2. LLM SELECTS from indexed element list, never GENERATES CSS selectors
+3. Pre-built locators are guaranteed to work
+
+Usage:
+    elements = extract_elements(page)
+    element = find_element(page, "the login button", elements)
+    page.locator(element.locator).click()
+"""
+
+from typing import List, Optional
+from pathlib import Path
+from pydantic import BaseModel, Field
+from pitchup_agent import llm_do
+import json
+import os
+
+
+class ElementNotFoundError(Exception):
+    """Raised when element cannot be found with LLM suggestions."""
+    pass
+
+
+# Base directory for loading scripts and prompts
+_BASE_DIR = Path(__file__).parent
+
+# Reload prompts on each use (so changes are picked up without restart)
+def _get_extract_js():
+    """Load extract_elements.js fresh each time (no caching for development)."""
+    return (_BASE_DIR / "scripts" / "extract_elements.js").read_text()
+
+def _get_element_matcher_prompt():
+    """Load element_matcher.md fresh each time (no caching for development)."""
+    return (_BASE_DIR / "prompts" / "element_matcher.md").read_text()
+
+
+class InteractiveElement(BaseModel):
+    """An interactive element on the page with pre-built locator.
+
+    The frame field tracks which document context the element belongs to:
+    - 'main': Element is in the main page document
+    - iframe name/id: Element is inside that specific iframe (e.g., 'scormContent', 'iframe-0')
+
+    This enables extraction from SCORM content, embedded widgets, and other iframe-based UIs.
+    """
+    index: int
+    tag: str
+    text: str = ""
+    role: Optional[str] = None
+    aria_label: Optional[str] = None
+    placeholder: Optional[str] = None
+    input_type: Optional[str] = None
+    href: Optional[str] = None
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
+    frame: str = "main"  # Frame context: 'main' or iframe identifier
+    locator: str = ""
+
+
+class ElementMatch(BaseModel):
+    index: int = Field(..., description="Index of the matching element, or -1 if not found")
+    confidence: float = Field(default=1.0, description="Confidence 0-1")
+    ambiguous: bool = Field(default=False)
+    reasoning: str = Field(...)
+    alternatives: Optional[List[int]] = Field(default=None)
+
+
+def extract_elements(page) -> List[InteractiveElement]:
+    """Extract all interactive elements from the page.
+
+    Returns elements with:
+    - Bounding boxes (for position matching with screenshot)
+    - Pre-built Playwright locators (guaranteed to work)
+    - Text/aria/placeholder for LLM matching
+    """
+    raw = page.evaluate(_get_extract_js())
+
+    # Write elements to file for inspection
+    debug_dir = Path.home() / ".co" / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_file = debug_dir / "elements.json"
+
+    with open(debug_file, 'w') as f:
+        json.dump(raw, f, indent=2)
+
+    # Count elements by frame context
+    main_els = [el for el in raw if el.get('frame') == 'main']
+    other_els = [el for el in raw if el.get('frame') != 'main']
+    frame_names = set(el.get('frame') for el in other_els) if other_els else set()
+
+    print(f"\n[element_finder] Extracted {len(raw)} elements (main: {len(main_els)}, other: {len(other_els)} [{', '.join(frame_names)}])")
+
+    return [InteractiveElement(**el) for el in raw]
+
+
+def format_elements_for_llm(elements: List[InteractiveElement]) -> str:
+    """Format elements as compact list for LLM context.
+
+    Format: [index] tag "text" pos=(x,y) frame=context {extra info}
+    """
+    lines = []
+    for el in elements:
+        parts = [f"[{el.index}]", el.tag]
+
+        # Show text if present
+        if el.text:
+            parts.append(f'"{el.text}"')
+
+        # ALWAYS show placeholder and aria-label if they exist (important for matching!)
+        if el.placeholder:
+            parts.append(f'placeholder="{el.placeholder}"')
+        if el.aria_label:
+            parts.append(f'aria="{el.aria_label}"')
+
+        parts.append(f"pos=({el.x},{el.y})")
+
+        # Show frame context (especially useful for SCORM/iframe content)
+        if el.frame != "main":
+            parts.append(f"frame={el.frame}")
+
+        # Show all available attributes that help with matching
+        if el.input_type:
+            parts.append(f"type={el.input_type}")
+        if el.role:
+            parts.append(f"role={el.role}")
+
+        if el.href:
+            href_short = el.href.split('?')[0][-30:]
+            parts.append(f"href=...{href_short}")
+
+        lines.append(' '.join(parts))
+
+    return '\n'.join(lines)
+
+
+def find_element(
+    page,
+    description: str,
+    elements: List[InteractiveElement] = None
+) -> InteractiveElement:
+    """Find an interactive element by natural language description.
+
+    This is the core function. LLM SELECTS from pre-built options.
+
+    Args:
+        page: Playwright page
+        description: Natural language like "the login button" or "email field"
+        elements: Pre-extracted elements (will extract if not provided)
+
+    Returns:
+        Matching InteractiveElement with pre-built locator, or None
+    """
+    if elements is None:
+        elements = extract_elements(page)
+
+    if not elements:
+        print(f"\n{'='*60}")
+        print(f"❌ Could not find element: '{description}'")
+        print(f"⚠️  No interactive elements found on page!")
+        print(f"{'='*60}\n")
+        return None
+
+    element_list = format_elements_for_llm(elements)
+
+    # Debug: print element count
+    print(f"\n[element_finder] DEBUG: Formatted {len(elements)} elements for LLM matching")
+
+    # Build prompt from template
+    prompt = _get_element_matcher_prompt().format(
+        description=description,
+        element_list=element_list
+    )
+
+    result = llm_do(
+        prompt,
+        output=ElementMatch,
+        model="gpt-4o",
+        temperature=0.1
+    )
+
+    if result.index == -1:
+        alt_str = ""
+        if result.alternatives:
+            alt_str = "\nSuggested alternatives:\n" + "\n".join(
+                f"  [{elements[i].index}] {elements[i].tag} text='{elements[i].text}' aria='{elements[i].aria_label}' pos=({elements[i].x},{elements[i].y})"
+                for i in result.alternatives if 0 <= i < len(elements)
+            )
+        raise ElementNotFoundError(f"{result.reasoning}{alt_str}")
+
+    if result.ambiguous and result.alternatives:
+        candidates = [result.index] + result.alternatives
+        candidates_str = "\n".join(
+            f"  [{elements[i].index}] {elements[i].tag} text='{elements[i].text}' aria='{elements[i].aria_label}' pos=({elements[i].x},{elements[i].y})"
+            for i in candidates if 0 <= i < len(elements)
+        )
+        raise ElementNotFoundError(
+            f"Ambiguous: multiple elements match '{description}'.\n"
+            f"Candidates:\n{candidates_str}\n"
+            f"Be more specific — include author name, position, or a unique attribute."
+        )
+
+    if 0 <= result.index < len(elements):
+        selected = elements[result.index]
+        # Enhanced debug logging - print all attributes
+        print(f"\n{'='*60}")
+        print(f"[element_finder] Looking for: '{description}'")
+        print(f"[element_finder] Selected element:")
+        print(f"  Index: [{selected.index}]")
+        print(f"  Tag: {selected.tag}")
+        print(f"  Text: '{selected.text}'")
+        print(f"  Position: ({selected.x},{selected.y}) size: {selected.width}x{selected.height}")
+        print(f"  Frame: {selected.frame}")
+        print(f"  Role: {selected.role}")
+        print(f"  Aria-label: {selected.aria_label}")
+        print(f"  Placeholder: {selected.placeholder}")
+        print(f"  Locator: {selected.locator}")
+        print(f"[element_finder] Reasoning: {result.reasoning}")
+        print(f"{'='*60}\n")
+        return selected
+
+    # Element index out of range or LLM couldn't find a match
+    raise ElementNotFoundError(description, elements, result.reasoning)
