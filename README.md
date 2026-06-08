@@ -67,20 +67,30 @@ python cli.py run "Wait 8 seconds, use click_available_slot tool, wait 2 seconds
 
 ```
 browser-agent/
-├── main.py              # FastAPI server — /health, /fetch-availability, /complete-booking
-├── pitchup_agent.py     # PitchupAgent class — main agent loop + all tools
-├── agent.py             # Creates shared agent instance
-├── models.py            # Pydantic request/response models
-├── utils.py             # parse_agent_slots(), extract_screenshot_from_steps()
-├── cli.py               # CLI for local testing
+├── main.py                          # FastAPI endpoints only
+├── agent.py                         # Creates shared agent instance
+├── pitchup_agent.py                 # PitchupAgent class only (slim)
+├── cli.py                           # CLI entry point
+├── models.py                        # Pydantic models
+├── utils.py                         # parse_agent_slots, extract_screenshot
+│
 ├── tools/
 │   ├── browser_tools/
-│   │   ├── browser.py        # BrowserAutomation (Playwright wrapper)
-│   │   └── element_finder.py # AI-powered element finder
-│   └── pitchup_tools.py      # Venue-specific tools (get_availability_slots etc.)
-├── prompts/
-│   └── pitchup_agent.md      # System prompt
-└── requirements.txt
+│   │   ├── browser.py               # BrowserAutomation (existing)
+│   │   ├── element_finder.py        # AI element finder (existing)
+│   │   ├── browser_config.py        # Chrome args (existing)
+│   │   └── scroll.py                # Scroll logic (existing)
+│   │
+│   ├── pitchup_tools.py             # get_availability_slots etc (existing)
+│   ├── tool_definitions.py          # NEW: _get_browser_tool_definitions()
+│   └── tool_executor.py             # NEW: _execute_browser_tool()
+│
+├── core/
+│   ├── llm.py                       # NEW: llm_do(), _compress_screenshot()
+│   └── message_cleaner.py           # NEW: _clean_messages()
+│
+└── prompts/
+    └── pitchup_agent.md             # System prompt (existing)
 ```
 
 ## Custom Browser Tools

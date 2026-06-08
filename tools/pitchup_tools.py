@@ -4,8 +4,8 @@
 # using Claude's vision to extract machine-readable JSON
 
 import json
-from pitchup_agent import llm_do  # PitchupAgent is the brain
-from pitchup_agent import _compress_screenshot
+from core import llm_do  # PitchupAgent is the brain
+from core import compress_screenshot as _compress_screenshot
 
 # ─────────────────────────────────────────────
 # TOOL DEFINITIONS — added to TOOLS list in pitchup_agent.py
