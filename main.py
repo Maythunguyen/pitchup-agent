@@ -25,6 +25,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    return {
+        "name": "PitchUp Browser Agent API",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+        "endpoints": {
+            "health": "GET /health",
+            "fetch_availability": "POST /fetch-availability",
+            "complete_booking": "POST /complete-booking"
+        }
+    }
+
 #Health check endpoint
 @app.get("/health", response_model=HealthResponse)
 def health():
