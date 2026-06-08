@@ -1,113 +1,121 @@
-# Browser Agent
+# PitchUp Browser Agent
 
-A natural language browser automation agent powered by ConnectOnion and Playwright.
+An AI browser agent that fetches live venue availability and completes court bookings on behalf of PitchUp users. Built with Playwright + GPT-4o.
+
+## What It Does
+
+- Navigates venue booking sites autonomously
+- Fetches real-time availability from ThinkSmart and ClubSpark systems
+- Completes bookings including date selection, slot picking, duration and user details
+- Returns booking summaries before payment — user confirms in PitchUp UI
+
+## Supported Venues
+
+| Venue | System | Login Required |
+|-------|--------|---------------|
+| Fawkner Park Tennis Centre | ThinkSmart | No |
+| Carlton Gardens Tennis Club | ClubSpark | Yes |
 
 ## Quick Start
 
-The fastest way to use the browser agent is via the ConnectOnion CLI:
-
 ```bash
-pip install connectonion
-co browser
-```
-
-## For Developers
-
-If you want to customize the browser agent (modify tools, prompts, or add new capabilities), clone this repo as a starting point:
-
-```bash
-git clone https://github.com/openonion/browser-agent.git
-cd browser-agent
-./setup.sh
-```
-
-### Customizing Browser Tools
-
-The browser tools live in the ConnectOnion SDK. Instead of modifying them directly, use `co copy` to copy them into your project for customization:
-
-```bash
-# Copy browser tools to your local ./tools/ directory
-co copy browser_tools
-```
-
-This gives you a local copy you can modify freely. The default `tools/browser.py` is a thin re-export from the SDK:
-
-```python
-from connectonion.useful_tools.browser_tools import BrowserAutomation
-web = BrowserAutomation()
-```
-
-After running `co copy`, you'll have the full source locally and can customize element finding, scrolling, keyboard handling, etc.
-
-### Manual Setup
-
-```bash
+# Install dependencies
 pip install -r requirements.txt
-co init
-playwright install
-co auth
+playwright install chromium
+
+# Set environment variables
+cp .env.example .env
+# Add your OPENAI_API_KEY to .env
+
+# Start the API server
+uvicorn main:app --reload --port 8001
 ```
 
-## Usage
+## API Endpoints
+
+```
+GET  /health               → Check agent is running
+POST /fetch-availability   → Get live slots from venue
+POST /complete-booking     → Agent navigates and books
+POST /preview-booking      → Agent fills form, stops before payment
+```
+
+### Example Request
 
 ```bash
-# Single task
-python cli.py run "Go to news.ycombinator.com and find the top story"
-
-# Interactive mode
-python cli.py interactive
+curl -X POST http://localhost:8001/fetch-availability \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://www.thinksmartsoftware-au.com/OB/timetable.php?c=5D34328022065&v=1&t=tennisbiz",
+    "task": "Wait 3 seconds, find available slots, return as TIME — COURT — AVAILABLE or BOOKED"
+  }'
 ```
 
-```python
-from agent import create_agent
+## CLI Testing
 
-agent = create_agent()
-agent.input("Go to google.com and search for AI news")
+```bash
+# Test availability fetch
+python cli.py run "Wait 8 seconds, use get_page_text to read all slots, say DONE" \
+  --url "https://www.thinksmartsoftware-au.com/OB/timetable.php?c=5D34328022065&v=1&t=tennisbiz"
+
+# Test full booking flow
+python cli.py run "Wait 8 seconds, use click_available_slot tool, wait 2 seconds. Use select_option with value='60 minutes'. Click Add Booking. Wait 3 seconds. Use get_page_text. Say DONE." \
+  --url "https://www.thinksmartsoftware-au.com/OB/timetable.php?c=5D34328022065&v=1&t=tennisbiz"
 ```
-
-## Features
-
-- Natural language browser control
-- Automatic screenshots with vision support (LLM sees the page)
-- Smart element finding (no CSS selectors needed)
-- Form automation
-- Persistent Chrome profile (cookies, sessions survive restarts)
-- Deep Research Mode (spawns sub-agents for multi-source research)
-- Platform-aware keyboard shortcuts (auto-detects macOS/Windows/Linux)
 
 ## Project Structure
 
 ```
 browser-agent/
-├── cli.py                   # CLI entry point
-├── agent.py                 # Agent configuration
-├── main.py                  # HTTP/WebSocket host
+├── main.py              # FastAPI server — /health, /fetch-availability, /complete-booking
+├── pitchup_agent.py     # PitchupAgent class — main agent loop + all tools
+├── agent.py             # Creates shared agent instance
+├── models.py            # Pydantic request/response models
+├── utils.py             # parse_agent_slots(), extract_screenshot_from_steps()
+├── cli.py               # CLI for local testing
 ├── tools/
-│   ├── browser.py           # Re-exports BrowserAutomation from SDK
-│   ├── file_tools.py        # File operations for research
-│   └── deep_research.py     # Deep research tool
-├── agents/
-│   └── deep_research.py     # Deep research sub-agent
+│   ├── browser_tools/
+│   │   ├── browser.py        # BrowserAutomation (Playwright wrapper)
+│   │   └── element_finder.py # AI-powered element finder
+│   └── pitchup_tools.py      # Venue-specific tools (get_availability_slots etc.)
 ├── prompts/
-│   ├── agent.md             # Main agent prompt
-│   ├── deep_research.md     # Research sub-agent prompt
-│   ├── element_matcher.md   # Element finding strategy
-│   ├── form_filler.md       # Form handling strategy
-│   └── scroll_strategy.md   # Scrolling strategy
-├── tests/
+│   └── pitchup_agent.md      # System prompt
 └── requirements.txt
 ```
 
+## Custom Browser Tools
+
+The agent has these tools beyond standard browser control:
+
+| Tool | Description |
+|------|-------------|
+| `click_available_slot` | Clicks first `td.Selectable` cell on ThinkSmart grid |
+| `select_option` | Selects dropdown value via JavaScript |
+| `set_date_by_js` | Sets date input directly via JavaScript |
+| `click_by_js` | Force-clicks element by text, bypasses visibility |
+| `fill_field_by_js` | Fills form fields inside modals via JavaScript |
+
+## Environment Variables
+
+```
+OPENAI_API_KEY=your_key_here
+```
+
+## Deploy to Railway
+
+1. Push to GitHub
+2. Connect repo on railway.app
+3. Add `OPENAI_API_KEY` environment variable
+4. Railway auto-deploys via `railway.toml`
+
+Live URL format: `https://pitchup-agent-xxx.railway.app`
+
 ## How It Works
 
-1. You describe what you want in plain English
-2. The agent plans browser actions via LLM
-3. Playwright executes the browser control
-4. Screenshots feed back to the LLM for visual verification
-5. Agent reports results at each step
-
-## Run Tests
-
-```bash
-python tests/test_all.py
-```
+1. PitchUp frontend calls `/fetch-availability` with venue URL
+2. Agent opens headless browser, navigates to venue site
+3. Agent reads live slot data and returns structured results
+4. User selects slot in PitchUp UI and confirms booking
+5. PitchUp frontend calls `/complete-booking`
+6. Agent navigates booking flow, fills details, stops before payment
+7. Agent returns booking summary — PitchUp confirms and charges user

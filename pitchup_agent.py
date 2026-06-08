@@ -1,4 +1,3 @@
-
 import json
 from pathlib import Path
 from typing import Type, TypeVar
@@ -17,68 +16,37 @@ _openai = OpenAI()
 T = TypeVar("T", bound=BaseModel)
 
 
-# ─────────────────────────────────────────────
-# SCREENSHOT COMPRESSOR
-# Must be defined before PitchupAgent class
-# ─────────────────────────────────────────────
-
 def _compress_screenshot(b64_data: str, max_width: int = 1280) -> str:
-    """Resize and compress screenshot to reduce token usage"""
     img_bytes = base64.b64decode(b64_data)
     img = Image.open(io.BytesIO(img_bytes))
-
     if img.width > max_width:
         ratio = max_width / img.width
         new_height = int(img.height * ratio)
         img = img.resize((max_width, new_height), Image.LANCZOS)
-
     buffer = io.BytesIO()
     img.convert("RGB").save(buffer, format="JPEG", quality=70)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-# ─────────────────────────────────────────────
-# llm_do — call OpenAI like a simple function
-# drop-in replacement for connectonion.llm_do
-# ─────────────────────────────────────────────
-
 def llm_do(prompt, output=None, model="gpt-4o", temperature=0.1, system=None, image_b64=None):
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
-
     content = []
     if image_b64:
         if image_b64.startswith("data:image"):
             image_b64 = image_b64.split(",", 1)[1].split("\n")[0].strip()
-        # Compress image before sending
         image_b64 = _compress_screenshot(image_b64)
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
-        })
-
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
     if output:
-        content.append({
-            "type": "text",
-            "text": f"{prompt}\n\nReturn ONLY valid JSON. No markdown."
-        })
+        content.append({"type": "text", "text": f"{prompt}\n\nReturn ONLY valid JSON. No markdown."})
     else:
         content.append({"type": "text", "text": prompt})
-
     messages.append({"role": "user", "content": content})
-
-    response = _openai.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=messages
-    )
-
+    response = _openai.chat.completions.create(model=model, temperature=temperature, messages=messages)
     raw = response.choices[0].message.content.strip()
-
     if output is None:
         return raw
-
     try:
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -88,10 +56,6 @@ def llm_do(prompt, output=None, model="gpt-4o", temperature=0.1, system=None, im
     except Exception as e:
         raise ValueError(f"Failed to parse response: {e}")
 
-
-# ─────────────────────────────────────────────
-# LOAD SYSTEM PROMPT
-# ─────────────────────────────────────────────
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "pitchup_agent.md"
 SYSTEM_PROMPT = _PROMPT_PATH.read_text() if _PROMPT_PATH.exists() else """
@@ -103,12 +67,7 @@ Say DONE when finished, FAILED if unsuccessful.
 """
 
 
-# ─────────────────────────────────────────────
-# TOOL SCHEMA CONVERTER
-# ─────────────────────────────────────────────
-
 def _to_openai_tools(tools: list) -> list:
-    """Convert Anthropic-style tool definitions to OpenAI format"""
     return [
         {
             "type": "function",
@@ -122,25 +81,13 @@ def _to_openai_tools(tools: list) -> list:
     ]
 
 
-# ─────────────────────────────────────────────
-# MESSAGE HISTORY CLEANER
-# Remove old screenshots to save tokens
-# ─────────────────────────────────────────────
-
 def _clean_messages(messages: list) -> list:
-    """
-    Remove old screenshot tool results from message history.
-    Only keep the latest screenshot — old ones waste tokens.
-    """
     cleaned = []
     screenshot_count = 0
-
-    # Count total screenshots
     total_screenshots = sum(
         1 for m in messages
         if m.get("role") == "tool" and "image_url" in str(m.get("content", ""))
     )
-
     for m in messages:
         is_screenshot = (
             m.get("role") == "tool" and
@@ -148,9 +95,7 @@ def _clean_messages(messages: list) -> list:
         )
         if is_screenshot:
             screenshot_count += 1
-            # Only keep the latest screenshot
             if screenshot_count < total_screenshots:
-                # Replace old screenshot with placeholder to maintain message chain
                 cleaned.append({
                     "role": "tool",
                     "tool_call_id": m["tool_call_id"],
@@ -158,30 +103,16 @@ def _clean_messages(messages: list) -> list:
                 })
                 continue
         cleaned.append(m)
-
     return cleaned
 
 
-# ─────────────────────────────────────────────
-# PITCHUP AGENT CLASS
-# ─────────────────────────────────────────────
-
 class PitchupAgent:
-    """
-    The central brain of the Pitchup browser agent system.
-    OpenAI powers the LLM. Playwright handles the browser.
-    Everything imports from here.
-    """
-
     def __init__(self, max_iterations: int = 20, headless: bool = True):
         self.max_iterations = max_iterations
         self.headless = headless
         self._openai = _openai
 
     def run(self, task: str, url: str) -> dict:
-        """
-        Main agent loop — Think → Act → Observe → Repeat
-        """
         from tools.browser_tools.browser import BrowserAutomation
         from tools.pitchup_tools import PITCHUP_TOOLS, execute_pitchup_tool
 
@@ -205,23 +136,17 @@ class PitchupAgent:
         try:
             for i in range(self.max_iterations):
                 print(f"── Step {i + 1}/{self.max_iterations} ──")
-
-                # Clean old screenshots before each API call
                 clean_msgs = _clean_messages(messages)
-
-                # Ask OpenAI what to do next
                 response = self._openai.chat.completions.create(
                     model="gpt-4o",
-                    max_tokens=1024,
+                    max_tokens=2048,
                     tools=ALL_TOOLS,
                     messages=clean_msgs
                 )
-
                 choice = response.choices[0]
                 finish_reason = choice.finish_reason
                 print(f"Finish reason: {finish_reason}")
 
-                # Done — no more tool calls
                 if finish_reason == "stop":
                     final_text = choice.message.content or ""
                     print(f"✅ Finished: {final_text[:100]}")
@@ -229,10 +154,7 @@ class PitchupAgent:
                     result["data"] = final_text
                     break
 
-                # Tool calls
                 if finish_reason == "tool_calls" and choice.message.tool_calls:
-
-                    # Add assistant message
                     messages.append({
                         "role": "assistant",
                         "content": choice.message.content,
@@ -249,28 +171,18 @@ class PitchupAgent:
                         ]
                     })
 
-                    # Execute each tool
                     for tool_call in choice.message.tool_calls:
                         tool_name = tool_call.function.name
                         tool_input = json.loads(tool_call.function.arguments)
-
                         print(f"🔧 {tool_name}: {json.dumps(tool_input)[:60]}")
 
-                        # Route to correct executor
-                        if tool_name in ["get_availability_slots",
-                                         "extract_booking_confirmation",
-                                         "get_page_structured_data"]:
-                            tool_output = execute_pitchup_tool(
-                                browser, tool_name, tool_input
-                            )
+                        if tool_name in ["get_availability_slots", "extract_booking_confirmation", "get_page_structured_data"]:
+                            tool_output = execute_pitchup_tool(browser, tool_name, tool_input)
                         else:
-                            tool_output = _execute_browser_tool(
-                                browser, tool_name, tool_input
-                            )
+                            tool_output = _execute_browser_tool(browser, tool_name, tool_input)
 
                         print(f"   → {str(tool_output)[:80]}")
 
-                        # Screenshots — compress and add as image
                         if tool_name == "take_screenshot":
                             try:
                                 parsed = json.loads(tool_output)
@@ -280,9 +192,7 @@ class PitchupAgent:
                                     "tool_call_id": tool_call.id,
                                     "content": json.dumps({
                                         "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/jpeg;base64,{compressed}"
-                                        }
+                                        "image_url": {"url": f"data:image/jpeg;base64,{compressed}"}
                                     })
                                 })
                             except Exception:
@@ -310,12 +220,7 @@ class PitchupAgent:
 
         return result
 
-    # ─────────────────────────────────────────
-    # PITCHUP-SPECIFIC TASKS
-    # ─────────────────────────────────────────
-
     def fetch_availability(self, venue_url: str, sport: str, date: str) -> dict:
-        """Visit a venue website and return available booking slots."""
         task = f"""
         Find available booking slots on this venue website.
         Sport: {sport} | Date: {date}
@@ -327,23 +232,91 @@ class PitchupAgent:
         """
         return self.run(task, venue_url)
 
-    def complete_booking(self, venue_url: str, slot: dict, user: dict) -> dict:
-        """Complete a booking on a venue website for a Pitchup user."""
+    def complete_booking(self, venue_url: str, slot: dict, user: dict,
+                         login_email: str = None, login_password: str = None) -> dict:
+
+        duration_mins = slot.get('duration', 60)
+
+        # ── ThinkSmart (Fawkner Park) — no login, use CSS selector ──
+        if "thinksmartsoftware" in venue_url:
+            raw_date = slot.get('date', '')
+            try:
+                parts = raw_date.split("-")
+                display_date = f"{parts[2]}/{parts[1]}/{parts[0]}"
+            except:
+                display_date = raw_date
+
+            task = f"""
+            STEP 1 — Set date:
+            - Wait 8 seconds for page to load
+            - Use set_date_by_js tool with date='{display_date}'
+            - Wait 2 seconds, take a screenshot
+            - DO NOT click the date field or open any calendar
+
+            STEP 2 — Click available slot:
+            - Use click_available_slot tool
+            - Wait 2 seconds
+
+            STEP 3 — Select duration:
+            - Use select_option tool with selector='select' and value='{duration_mins} minutes'
+            - Wait 1 second
+
+            STEP 4 — Add Booking:
+            - Click the 'Add Booking' button
+            - Wait 3 seconds, take a screenshot
+
+            STEP 5 — Read booking summary:
+            - A "View Bookings" modal appears showing Date, Court, Time, Duration
+            - Use get_page_text to read all details
+            - DO NOT click Checkout yet
+            - Say DONE with: Court, Date, Time, Duration
+
+            IMPORTANT: Do not say DONE until you see the View Bookings modal.
+            """
+            self.max_iterations = 30
+            return self.run(task, venue_url)
+
+        # ── ClubSpark (Carlton Gardens) — login required ──
+        login_step = f"""
+        STEP 1 — Log in:
+        - Navigate to: https://auth-play.tennis.com.au/account/signin
+        - Wait 3 seconds
+        - Click Email address field, type '{login_email}'
+        - Click Password field, type '{login_password}'
+        - Click Sign in button
+        - Wait 5 seconds
+        - Navigate to: {venue_url}
+        - Wait 5 seconds, take a screenshot
+        """ if login_email else ""
+
         task = f"""
-        Complete a booking: {slot.get('sport')} on {slot.get('date')} at {slot.get('time')}
-        User: {user.get('name')}, {user.get('email')}, {user.get('phone')}
-        1. Wait 3 seconds for page to load
-        2. Take a screenshot
-        3. Find booking form
-        4. Fill in all details field by field
-        5. Submit
-        6. Use extract_booking_confirmation tool
-        7. Say DONE with confirmation — FAILED if unsuccessful
+        {login_step}
+
+        STEP 2 — Navigate to correct date:
+        - Take a screenshot to confirm booking page loaded
+        - Click the '>' Next Day button until date shows {slot.get('date')}
+        - Wait 2 seconds after each click, take screenshot, check date
+        - Do NOT proceed until correct date confirmed on screen
+
+        STEP 3 — Find and click available slot:
+        - Use get_page_text to read all text on the page
+        - Available slots show a price like "$12.50" or "$15.00"
+        - Click the element showing a price closest to {slot.get('time')}
+        - Wait 3 seconds, take a screenshot
+
+        STEP 4 — On "Confirm your booking and pay" page:
+        - Verify page title says "Confirm your booking and pay"
+        - Use get_page_text to read ALL details
+        - DO NOT click "Confirm and pay"
+        - Say DONE with: Venue, Court, Date, Time, Total Cost
+
+        CRITICAL: Summary must match what is ACTUALLY on screen.
+        Do not say DONE until you reach the Confirm page.
         """
+        self.max_iterations = 30
         return self.run(task, venue_url)
 
     def discover_venues(self, sport: str, suburb: str) -> dict:
-        """Search Google for new venues not yet on Pitchup."""
         url = f"https://www.google.com/search?q={sport}+venue+hire+{suburb}+Australia"
         task = f"""
         Find {sport} venues in {suburb} not yet on Pitchup.
@@ -356,10 +329,6 @@ class PitchupAgent:
         return self.run(task, url)
 
 
-# ─────────────────────────────────────────────
-# BROWSER TOOL DEFINITIONS
-# ─────────────────────────────────────────────
-
 def _get_browser_tool_definitions():
     return [
         {
@@ -368,11 +337,7 @@ def _get_browser_tool_definitions():
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "full_page": {
-                        "type": "boolean",
-                        "description": "Always set to false",
-                        "default": False
-                    }
+                    "full_page": {"type": "boolean", "description": "Always set to false", "default": False}
                 },
                 "required": []
             }
@@ -382,9 +347,7 @@ def _get_browser_tool_definitions():
             "description": "Navigate to a URL",
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Full URL to navigate to"}
-                },
+                "properties": {"url": {"type": "string", "description": "Full URL to navigate to"}},
                 "required": ["url"]
             }
         },
@@ -393,10 +356,72 @@ def _get_browser_tool_definitions():
             "description": "Click an element using plain English description. Uses AI vision to find it.",
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "description": {"type": "string", "description": "e.g. 'the Sports category tab'"}
-                },
+                "properties": {"description": {"type": "string", "description": "e.g. 'the Sports category tab'"}},
                 "required": ["description"]
+            }
+        },
+        {
+            "name": "click_available_slot",
+            "description": "Click the first available booking slot on ThinkSmart venue grid using CSS selector td.Selectable. Use this for Fawkner Park and Powlett Reserve bookings.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "select_option",
+            "description": "Select an option from a dropdown by its label text. Use this instead of click for <select> dropdowns.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the select element e.g. 'select'"
+                    },
+                    "value": {
+                        "type": "string", 
+                        "description": "The option label to select e.g. '60 minutes'"
+                    }
+                },
+                "required": ["selector", "value"]
+            }
+        },
+        {
+            "name": "fill_field_by_js",
+            "description": "Fill an input field using JavaScript by finding it via its label text. Use when normal click+type fails inside modals.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Label text above the field e.g. 'First name', 'Email address'"},
+                    "value": {"type": "string", "description": "Value to fill in"}
+                },
+                "required": ["label", "value"]
+            }
+        },
+        {
+            "name": "click_by_js",
+            "description": "Force click a button by its text using JavaScript. Use when normal click fails with 'element not visible'. Works even if element is behind overlays.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Button text to click e.g. 'I am not a Member'"}
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "set_date_by_js",
+            "description": "Set the date on ThinkSmart booking calendar directly using JavaScript. Use this instead of clicking the calendar. Date must be in DD/MM/YYYY format e.g. '19/06/2026'.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Date in DD/MM/YYYY format e.g. '19/06/2026'"
+                    }
+                },
+                "required": ["date"]
             }
         },
         {
@@ -404,20 +429,16 @@ def _get_browser_tool_definitions():
             "description": "Type text into the currently focused element",
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "text": {"type": "string"}
-                },
+                "properties": {"text": {"type": "string"}},
                 "required": ["text"]
             }
         },
         {
             "name": "keyboard_press",
-            "description": "Press a key e.g. Enter, Tab, Escape",
+            "description": "Press a key e.g. Enter, Tab, Escape, ArrowRight, ArrowLeft",
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "key": {"type": "string"}
-                },
+                "properties": {"key": {"type": "string"}},
                 "required": ["key"]
             }
         },
@@ -436,44 +457,27 @@ def _get_browser_tool_definitions():
         {
             "name": "get_page_text",
             "description": "Get all visible text from the current page",
-            "input_schema": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
+            "input_schema": {"type": "object", "properties": {}, "required": []}
         },
         {
             "name": "get_current_url",
             "description": "Get the current page URL",
-            "input_schema": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
+            "input_schema": {"type": "object", "properties": {}, "required": []}
         },
         {
             "name": "wait",
             "description": "Wait for seconds for the page to load",
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "seconds": {"type": "number", "default": 2}
-                },
+                "properties": {"seconds": {"type": "number", "default": 2}},
                 "required": []
             }
         }
     ]
 
 
-# ─────────────────────────────────────────────
-# BROWSER TOOL EXECUTOR
-# ─────────────────────────────────────────────
-
 def _execute_browser_tool(browser, tool_name: str, tool_input: dict) -> str:
-    """Execute a browser tool via BrowserAutomation"""
-
     if tool_name == "take_screenshot":
-        # Always force full_page=False to avoid token limit errors
         result = browser.take_screenshot(full_page=False)
         if result.startswith("data:image/png;base64,"):
             b64 = result.split(",", 1)[1].split("\n")[0].strip()
@@ -489,11 +493,140 @@ def _execute_browser_tool(browser, tool_name: str, tool_input: dict) -> str:
         except Exception as e:
             return f"Could not find element: {str(e)[:200]}"
 
+    elif tool_name == "click_available_slot":
+        # ── ThinkSmart: click first td.Selectable cell directly ──
+        try:
+            browser.page.wait_for_selector("td.Selectable", timeout=8000)
+            first_slot = browser.page.locator("td.Selectable").first
+            first_slot.click()
+            browser.page.wait_for_timeout(1000)
+            print("\n[browser] CLICKED first td.Selectable slot\n")
+            return "Clicked first available slot (td.Selectable)"
+        except Exception as e:
+            return f"Could not click available slot: {str(e)[:200]}"
+        
+    elif tool_name == "select_option":
+        try:
+            value = tool_input.get("value", "")
+            # Pure JS — no locator, works inside any modal
+            browser.page.evaluate(f"""
+                (() => {{
+                    const selects = document.querySelectorAll('select');
+                    for (const sel of selects) {{
+                        const options = Array.from(sel.options);
+                        const opt = options.find(o => o.text.trim() === '{value}');
+                        if (opt) {{
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            break;
+                        }}
+                    }}
+                }})();
+            """)
+            browser.page.wait_for_timeout(800)
+            print(f"\n[browser] SELECTED option '{value}' via JavaScript\n")
+            return f"Selected option: {value}"
+        except Exception as e:
+            return f"Could not select option: {str(e)[:200]}"
+        
+    elif tool_name == "click_by_js":
+        # Force click using JavaScript — bypasses visibility checks
+        try:
+            text = tool_input.get("text", "")
+            browser.page.evaluate(f"""
+                (() => {{
+                    const buttons = Array.from(document.querySelectorAll('button, a, input[type="button"]'));
+                    const btn = buttons.find(b => b.textContent.trim().includes('{text}'));
+                    if (btn) btn.click();
+                }})();
+            """)
+            browser.page.wait_for_timeout(1000)
+            print(f"\n[browser] JS CLICKED button with text '{text}'\n")
+            return f"JS clicked: {text}"
+        except Exception as e:
+            return f"Could not JS click: {str(e)[:200]}"
+        
+    elif tool_name == "fill_field_by_js":
+        try:
+            label = tool_input.get("label", "")
+            value = tool_input.get("value", "")
+            index = tool_input.get("index", -1)
+
+            # Find the input element via JS to get its selector
+            selector = browser.page.evaluate(f"""
+                (() => {{
+                    let input = null;
+
+                    if ({index} >= 0) {{
+                        const inputs = document.querySelectorAll('input');
+                        input = inputs[{index}];
+                    }}
+
+                    if (!input) {{
+                        const labels = Array.from(document.querySelectorAll('label'));
+                        const lbl = labels.find(l => l.textContent.trim().toLowerCase().includes('{label.lower()}'));
+                        if (lbl) {{
+                            input = document.getElementById(lbl.htmlFor) || lbl.nextElementSibling;
+                        }}
+                    }}
+
+                    if (!input) {{
+                        input = Array.from(document.querySelectorAll('input')).find(i =>
+                            (i.placeholder && i.placeholder.toLowerCase().includes('{label.lower()}')) ||
+                            (i.name && i.name.toLowerCase().includes('{label.lower()}'))
+                        );
+                    }}
+
+                    if (input) {{
+                        // Use native setter to trigger React/Vue onChange
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        nativeInputValueSetter.call(input, '{value}');
+                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        input.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                        return true;
+                    }}
+                    return false;
+                }})();
+            """)
+            browser.page.wait_for_timeout(300)
+            print(f"\n[browser] FILLED field '{label}' with '{value}'\n")
+            return f"Filled {label}: {value}"
+        except Exception as e:
+            return f"Could not fill field: {str(e)[:200]}"
+        
+    elif tool_name == "set_date_by_js":
+        try:
+            date_val = tool_input.get("date", "")
+            browser.page.evaluate(f"""
+                (() => {{
+                    const input = document.querySelector('input[type="text"]');
+                    if (input) {{
+                        input.value = '{date_val}';
+                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        input.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                    }}
+                }})();
+            """)
+            browser.page.wait_for_timeout(1000)
+            return f"Date set to: {date_val}"
+        except Exception as e:
+            return f"Could not set date: {str(e)}"
     elif tool_name == "type_text":
         return browser.keyboard_type(tool_input["text"])
 
     elif tool_name == "keyboard_press":
-        return browser.keyboard_press(tool_input["key"])
+        # Fix common key name mistakes
+        key_map = {
+            "RightArrow": "ArrowRight",
+            "LeftArrow": "ArrowLeft",
+            "UpArrow": "ArrowUp",
+            "DownArrow": "ArrowDown",
+        }
+        key = key_map.get(tool_input["key"], tool_input["key"])
+        return browser.keyboard_press(key)
 
     elif tool_name == "scroll":
         return browser.scroll(
@@ -513,17 +646,8 @@ def _execute_browser_tool(browser, tool_name: str, tool_input: dict) -> str:
     return f"Unknown tool: {tool_name}"
 
 
-# ─────────────────────────────────────────────
-# SHARED INSTANCE
-# from pitchup_agent import pitchup_agent
-# ─────────────────────────────────────────────
-
 pitchup_agent = PitchupAgent()
 
-
-# ─────────────────────────────────────────────
-# RUN DIRECTLY
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     agent = PitchupAgent(headless=False, max_iterations=15)

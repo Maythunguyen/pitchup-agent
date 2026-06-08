@@ -82,24 +82,27 @@ class ElementMatch(BaseModel):
 
 
 def extract_elements(page) -> List[InteractiveElement]:
-    """Extract all interactive elements from the page.
-
-    Returns elements with:
-    - Bounding boxes (for position matching with screenshot)
-    - Pre-built Playwright locators (guaranteed to work)
-    - Text/aria/placeholder for LLM matching
-    """
+    # Scan main frame
     raw = page.evaluate(_get_extract_js())
+    for el in raw:
+        el['frame'] = 'main'
 
-    # Write elements to file for inspection
-    debug_dir = Path.home() / ".co" / "debug"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    debug_file = debug_dir / "elements.json"
+    # Also scan iframes
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            iframe_raw = frame.evaluate(_get_extract_js())
+            frame_id = frame.name or frame.url.split('/')[2]  # e.g. "play.tennis.com.au"
+            for el in iframe_raw:
+                el['frame'] = frame_id
+            raw.extend(iframe_raw)
+            print(f"[element_finder] Scanned iframe: {frame_id} ({len(iframe_raw)} elements)")
+        except Exception as e:
+            # Cross-origin iframes may still block — skip silently
+            print(f"[element_finder] Skipped iframe (blocked): {frame.url[:50]}")
 
-    with open(debug_file, 'w') as f:
-        json.dump(raw, f, indent=2)
-
-    # Count elements by frame context
+    # Count elements
     main_els = [el for el in raw if el.get('frame') == 'main']
     other_els = [el for el in raw if el.get('frame') != 'main']
     frame_names = set(el.get('frame') for el in other_els) if other_els else set()
