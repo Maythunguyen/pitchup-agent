@@ -1,16 +1,21 @@
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from models import (
     AvailabilityRequest, AvailabilityResponse,
     BookingRequest, BookingResponse,
-    HealthResponse, StepLog,
+    HealthResponse,
     PreviewRequest, ConfirmRequest
 )
 import uvicorn
 
 load_dotenv()
+
+# ── Thread pool — Playwright sync must run in a thread inside asyncio ──
+executor = ThreadPoolExecutor(max_workers=2)
 
 app = FastAPI(
     title="PitchUp Browser Agent API",
@@ -25,6 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def root():
     return {
@@ -35,50 +41,73 @@ def root():
         "endpoints": {
             "health": "GET /health",
             "fetch_availability": "POST /fetch-availability",
-            "complete_booking": "POST /complete-booking"
+            "complete_booking": "POST /complete-booking",
+            "preview_booking": "POST /preview-booking",
         }
     }
 
-#Health check endpoint
 @app.get("/health", response_model=HealthResponse)
 def health():
     return {"status": "ok"}
 
 
-#fetch availability endpoint
 @app.post("/fetch-availability", response_model=AvailabilityResponse)
-def fetch_availability(req: AvailabilityRequest):
-    """
-    Agent navigates a venue URL and extracts available time slots + pricing.
-    Returns raw text + structured slot list + optional screenshot.
-    """
+async def fetch_availability(req: AvailabilityRequest):
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, lambda: _run_fetch(req))
+    return result
+
+
+def _run_fetch(req: AvailabilityRequest):
     from agent import create_agent
-    from utils import parse_agent_slots, extract_screenshot_from_steps
+    from utils import parse_agent_slots
 
     agent = create_agent(headless=True)
     result = agent.run(task=req.task, url=req.url)
-
-    # Parse raw text into structured slots
     slots = parse_agent_slots(result.get("data", ""))
-
-    # Extract screenshot from steps if available
-    screenshot = extract_screenshot_from_steps(result.get("steps", []))
 
     return AvailabilityResponse(
         status=result["status"],
         data=result.get("data"),
         slots=slots,
-        screenshot=screenshot,
+        steps=result.get("steps")
+    )
+
+@app.post("/complete-booking", response_model=BookingResponse)
+async def complete_booking(req: BookingRequest):
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, lambda: _run_complete(req))
+    return result
+
+
+def _run_complete(req: BookingRequest):
+    from pitchup_agent import PitchupAgent
+
+    agent = PitchupAgent(headless=True)
+    result = agent.complete_booking(
+        venue_url=req.url,
+        slot=req.slot.model_dump(),
+        user=req.user.model_dump(),
+        login_email=req.login_email,
+        login_password=req.login_password
+    )
+
+    return BookingResponse(
+        status=result["status"],
+        confirmation=result.get("data"),
         steps=result.get("steps")
     )
 
 @app.post("/preview-booking")
-def preview_booking(req: PreviewRequest):
-    """
-    Phase 1 — Agent fills the form but stops before payment.
-    Returns booking details for user to review.
-    """
+async def preview_booking(req: PreviewRequest):
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, lambda: _run_preview(req))
+    return result
+
+
+def _run_preview(req: PreviewRequest):
     from pitchup_agent import PitchupAgent
+
     agent = PitchupAgent(headless=True)
 
     task = f"""
@@ -99,22 +128,30 @@ def preview_booking(req: PreviewRequest):
     result = agent.run(task=task, url=req.url)
     return {
         "status": result["status"],
-        "summary": result["data"],   # booking details for user to review
+        "summary": result["data"],
         "steps": result["steps"]
     }
 
 
+# ─────────────────────────────────────────────
+# CONFIRM BOOKING
+# Phase 2 — user confirmed, agent clicks pay
+# ─────────────────────────────────────────────
+
 @app.post("/confirm-booking")
-def confirm_booking(req: ConfirmRequest):
-    """
-    Phase 2 — User confirmed, agent clicks pay and completes.
-    """
+async def confirm_booking(req: ConfirmRequest):
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, lambda: _run_confirm(req))
+    return result
+
+
+def _run_confirm(req: ConfirmRequest):
     from pitchup_agent import PitchupAgent
+
     agent = PitchupAgent(headless=True)
 
     task = f"""
-    Log in with email 'nguyentranminhthu.65@gmail.com' and password 'PitchUpDemo123'.
-    Navigate to the pending booking.
+    Navigate to the pending booking page.
     Click the pay or confirm button to complete the booking.
     Wait for confirmation page.
     Use extract_booking_confirmation to get the confirmation number.
@@ -128,31 +165,5 @@ def confirm_booking(req: ConfirmRequest):
         "steps": result["steps"]
     }
 
-#complete booking endpoint
-@app.post("/complete-booking", response_model=BookingResponse)
-def complete_booking(req: BookingRequest):
-    """
-    Agent logs in (if credentials provided), navigates to the booking form,
-    fills in user details and submits. Returns confirmation number.
-    """
-    from pitchup_agent import PitchupAgent
-
-    agent = PitchupAgent(headless=True)
-    result = agent.complete_booking(
-        venue_url=req.url,
-        slot=req.slot.model_dump(),
-        user=req.user.model_dump(),
-        login_email=req.login_email,
-        login_password=req.login_password
-    )
-
-    return BookingResponse(
-        status=result["status"],
-        confirmation=result.get("data"),
-        steps=result.get("steps")
-    )
-
-
 if __name__ == "__main__":
-    
     uvicorn.run(app, host="0.0.0.0", port=8001)
